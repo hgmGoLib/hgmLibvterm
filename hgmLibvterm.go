@@ -19,17 +19,32 @@ package hgmLibvterm
 #include <vterm.h>
 #include <stdint.h>
 
-// damage 回调由 Go 实现 (见下方 //export). 其余回调置 NULL.
+// damage / sb_pushline 回调由 Go 实现 (见下方 //export). 其余回调置 NULL.
+// 注意 cgo 按 Go 签名生成的原型是非 const 指针 (VTermScreenCell*), 而 libvterm 的 sb_pushline
+// 字段要求 const VTermScreenCell* —— 直接装会 "conflicting types". 所以下面用一个 const 签名的
+// C 蹦床 _hgm_sb_pushline 装进回调结构, 内部去 const 转调 Go 导出实现.
 extern int _go_vt_damage(VTermRect rect, void *user);
+extern int _go_vt_sb_pushline(int cols, VTermScreenCell *cells, void *user);
+
+static int _hgm_sb_pushline(int cols, const VTermScreenCell *cells, void *user) {
+	return _go_vt_sb_pushline(cols, (VTermScreenCell *)cells, user);
+}
 
 static VTermScreenCallbacks _hgm_screen_cbs = {
-	.damage = _go_vt_damage,
+	.damage      = _go_vt_damage,
+	.sb_pushline = _hgm_sb_pushline,
 };
 
-// _hgm_set_damage_cb 把 cgo.Handle (uintptr) 当不透明 void* 存进 libvterm,
-// damage 触发时原样回传给 _go_vt_damage.
-static void _hgm_set_damage_cb(VTermScreen *screen, uintptr_t user) {
+// _hgm_set_screen_cbs 把 cgo.Handle (uintptr) 当不透明 void* 存进 libvterm,
+// 回调触发时原样回传给对应的 _go_vt_* 导出函数.
+static void _hgm_set_screen_cbs(VTermScreen *screen, uintptr_t user) {
 	vterm_screen_set_callbacks(screen, &_hgm_screen_cbs, (void*)user);
+}
+
+// _hgm_sb_cell_at 按下标取 sb_pushline 传进来的 cell 数组元素 (cells 是一个长度 cols 的
+// const VTermScreenCell 数组). 用 C 取下标, 避免在 Go 侧对 C 数组做指针运算.
+static VTermScreenCell _hgm_sb_cell_at(const VTermScreenCell *cells, int i) {
+	return cells[i];
 }
 */
 import "C"
@@ -51,6 +66,15 @@ type Screen struct {
 	screen *C.VTermScreen
 	// OnDamage 在 Flush() 内同步回调 (与调用 Flush 的 goroutine 同线程), 返回值传回 C (一般忽略).
 	OnDamage func(*Rect) int
+	// OnSbPushLine 在一行从主屏顶部滚出 (进入 scrollback) 时同步回调, cells 是该行 cols 个格子.
+	// 这是采集"屏幕被挤到上面去的历史"的唯一途径 (GetCellAt 只能读当前可见网格).
+	//   - 与 OnDamage 一样在 Write/Flush 内、同一 goroutine 同步触发, 回调里不要再去锁调用方
+	//     在 Write 外层已持有的锁 (会自死锁); 直接往调用方的 buffer append 即可.
+	//   - 只有主屏 (primary buffer) 滚动才触发; alt screen (DECSET 1049) 期间的滚动不会 push,
+	//     libvterm 直接丢弃 (见 screen.c moverect_internal 的 not-altscreen 判定).
+	//   - 不设 (nil) 则不采集, 行为与加该字段前完全一致 (导出回调判 nil 直接返回).
+	// 返回值传回 C (libvterm 忽略 sb_pushline 返回值, 给 0 即可).
+	OnSbPushLine func(cells []ScreenCell) int
 }
 
 // Rect 是一块屏幕矩形区域 (damage 回调参数). 当前调用方只把它当不透明标志位用,
@@ -86,7 +110,7 @@ func New(req NewReq_t) *VTerm {
 	scr := &Screen{screen: C.vterm_obtain_screen(term)}
 	vt := &VTerm{term: term, screen: scr}
 	vt.handle = cgo.NewHandle(scr)
-	C._hgm_set_damage_cb(scr.screen, C.uintptr_t(vt.handle))
+	C._hgm_set_screen_cbs(scr.screen, C.uintptr_t(vt.handle))
 	if !req.DisableUTF8 {
 		vt.SetUTF8(true)
 	}
@@ -186,4 +210,21 @@ func _go_vt_damage(rect C.VTermRect, user unsafe.Pointer) C.int {
 		return 0
 	}
 	return C.int(scr.OnDamage(&Rect{rect: rect}))
+}
+
+//export _go_vt_sb_pushline
+func _go_vt_sb_pushline(cols C.int, cells *C.VTermScreenCell, user unsafe.Pointer) C.int {
+	scr, ok := cgo.Handle(uintptr(user)).Value().(*Screen)
+	if !ok || scr.OnSbPushLine == nil {
+		return 0
+	}
+	// cells 是一个长度 cols 的 const VTermScreenCell C 数组. 逐个用 C 下标 helper 拷成 Go 切片,
+	// 不在 Go 侧对 C 指针做算术. 拷贝是必要的: cells 指向 libvterm 内部复用的 sb_buffer, 回调
+	// 返回后内容会被下一行覆盖, 调用方若要留存必须现在读完 (这里拷成值类型 ScreenCell 已满足).
+	n := int(cols)
+	out := make([]ScreenCell, n)
+	for i := 0; i < n; i++ {
+		out[i] = ScreenCell{cell: C._hgm_sb_cell_at(cells, C.int(i))}
+	}
+	return C.int(scr.OnSbPushLine(out))
 }

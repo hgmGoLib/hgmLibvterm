@@ -155,6 +155,72 @@ func TestScrollAndClear(t *testing.T) {
 	}
 }
 
+// renderCells 把 sb_pushline 回传的一行 cells 还原成字符串 (逻辑同 renderRow, 但输入是
+// OnSbPushLine 的 cells 切片而非 GetCellAt). 行尾空格裁掉.
+func renderCells(cells []ScreenCell) string {
+	var sb strings.Builder
+	for i := 0; i < len(cells); {
+		c := cells[i]
+		w := c.Width()
+		if w < 1 {
+			w = 1
+		}
+		chars := c.Chars()
+		if len(chars) == 0 {
+			sb.WriteByte(' ')
+		} else {
+			for _, r := range chars {
+				sb.WriteRune(r)
+			}
+		}
+		i += w
+	}
+	return strings.TrimRight(sb.String(), " ")
+}
+
+// TestSbPushLine: 行从主屏顶部滚出时 OnSbPushLine 应按顺序拿到滚出的整行内容.
+// 这是采集 scrollback ("被挤到上面的历史") 的关键路径.
+func TestSbPushLine(t *testing.T) {
+	vt, scr, _ := newTestTerm(t, 3, 10)
+	defer vt.Close()
+
+	var scrollback []string
+	scr.OnSbPushLine = func(cells []ScreenCell) int {
+		scrollback = append(scrollback, renderCells(cells))
+		return 0
+	}
+
+	// 6 行进 3 行屏幕 -> L1 L2 L3 依次滚出顶部, 屏幕只剩 L4 L5 L6.
+	vt.Write([]byte("L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6"))
+	scr.Flush()
+
+	want := []string{"L1", "L2", "L3"}
+	if len(scrollback) != len(want) {
+		t.Fatalf("scrollback = %q, want %q", scrollback, want)
+	}
+	for i := range want {
+		if scrollback[i] != want[i] {
+			t.Fatalf("scrollback[%d] = %q, want %q (full=%q)", i, scrollback[i], want[i], scrollback)
+		}
+	}
+	// 可见屏应只剩末 3 行.
+	if got := renderRow(t, scr, 0, 10); got != "L4" {
+		t.Fatalf("visible row0 = %q, want L4", got)
+	}
+}
+
+// TestSbPushLineNilSafe: 不设 OnSbPushLine 时滚动不 panic (导出回调判 nil 直接返回),
+// 保证加该字段对老调用方零影响.
+func TestSbPushLineNilSafe(t *testing.T) {
+	vt, scr, _ := newTestTerm(t, 2, 6)
+	defer vt.Close()
+	vt.Write([]byte("a\r\nb\r\nc\r\nd")) // 滚动多次, OnSbPushLine 为 nil
+	scr.Flush()
+	if got := renderRow(t, scr, 0, 6); got != "c" {
+		t.Fatalf("visible row0 = %q, want c", got)
+	}
+}
+
 // TestEmptyWrite: 空切片 Write 走早返回分支, 返回 0 且不 panic.
 func TestEmptyWrite(t *testing.T) {
 	vt := New(NewReq_t{Rows: 2, Cols: 4})
