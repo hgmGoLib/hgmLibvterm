@@ -88,6 +88,15 @@ import vterm "github.com/hgmGoLib/hgmLibvterm"
     (*Screen) Flush() error                  // 同步触发 OnDamage
     (*Screen) GetCellAt(row, col int) (*ScreenCell, error)
     Screen.OnDamage func(*Rect) int          // 字段, 可不设
+    Screen.OnSbPushLine func(cells []ScreenCell) int // 字段, 可不设. 一行从主屏顶部滚出(进 scrollback)
+                                             // 时同步回调, cells 是该行所有格子. 采集"滚出屏幕的历史"
+                                             // 唯一途径 (GetCellAt 只能读当前可见网格). 注意:
+                                             //   * 与 OnDamage 一样在 Write/Flush 内同一 goroutine 同步触发,
+                                             //     回调里别再锁外层 Write 已持有的锁 (自死锁).
+                                             //   * 只有主屏滚动触发; alt screen (DECSET ?1049h) 期间滚动
+                                             //     libvterm 直接丢弃, 不 push.
+                                             //   * cells 指向 libvterm 内部复用缓冲, 回调返回后会被覆盖,
+                                             //     要留存必须当场读完 (ScreenCell 是值拷贝, 存切片即可).
     (*ScreenCell) Width() int                // 1 普通 / 2 宽字符
     (*ScreenCell) Chars() []rune             // 码点, 读到 0 止
     (*Rect) StartRow/EndRow/StartCol/EndCol() int
