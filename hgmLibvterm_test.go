@@ -209,6 +209,43 @@ func TestSbPushLine(t *testing.T) {
 	}
 }
 
+// TestSbPushLineAltScreenScrollRegion: 新版 claude/codex TUI 跑在 alt-screen(DECSET ?1049h)
+// 且用 scroll-region(DECSTBM) —— 滚出区顶的行原本被 upstream libvterm 丢弃 (gate 在 primary +
+// dest.start_row==0). 放宽后这种场景也应能 push 出滚出去的行, 否则详情页"完整终端历史"只剩最后一屏.
+func TestSbPushLineAltScreenScrollRegion(t *testing.T) {
+	vt, scr, _ := newTestTerm(t, 5, 10)
+	defer vt.Close()
+
+	var scrollback []string
+	scr.OnSbPushLine = func(cells []ScreenCell) int {
+		scrollback = append(scrollback, renderCells(cells))
+		return 0
+	}
+
+	// 进 alt screen; 设滚动区 rows 2..4 (1-based, 0-based 1..3); 光标移到区顶 (row2,col1).
+	// 然后在区内写 A B C D E, 触发区顶滚出: A B 应被 push, 可见区剩 C D E.
+	vt.Write([]byte("\x1b[?1049h\x1b[2;4r\x1b[2;1H"))
+	vt.Write([]byte("A\r\nB\r\nC\r\nD\r\nE"))
+	scr.Flush()
+
+	want := []string{"A", "B"}
+	if len(scrollback) != len(want) {
+		t.Fatalf("alt-screen scroll-region scrollback = %q, want %q", scrollback, want)
+	}
+	for i := range want {
+		if scrollback[i] != want[i] {
+			t.Fatalf("scrollback[%d] = %q, want %q (full=%q)", i, scrollback[i], want[i], scrollback)
+		}
+	}
+	// 滚动区现在 (0-based) row1=C row2=D row3=E; 区外 row0 仍空.
+	if got := renderRow(t, scr, 1, 10); got != "C" {
+		t.Fatalf("region top row1 = %q, want C", got)
+	}
+	if got := renderRow(t, scr, 3, 10); got != "E" {
+		t.Fatalf("region bottom row3 = %q, want E", got)
+	}
+}
+
 // TestSbPushLineNilSafe: 不设 OnSbPushLine 时滚动不 panic (导出回调判 nil 直接返回),
 // 保证加该字段对老调用方零影响.
 func TestSbPushLineNilSafe(t *testing.T) {

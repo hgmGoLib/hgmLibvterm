@@ -70,8 +70,9 @@ type Screen struct {
 	// 这是采集"屏幕被挤到上面去的历史"的唯一途径 (GetCellAt 只能读当前可见网格).
 	//   - 与 OnDamage 一样在 Write/Flush 内、同一 goroutine 同步触发, 回调里不要再去锁调用方
 	//     在 Write 外层已持有的锁 (会自死锁); 直接往调用方的 buffer append 即可.
-	//   - 只有主屏 (primary buffer) 滚动才触发; alt screen (DECSET 1049) 期间的滚动不会 push,
-	//     libvterm 直接丢弃 (见 screen.c moverect_internal 的 not-altscreen 判定).
+	//   - 主屏和 alt screen (DECSET ?1049) 的"向上滚动"都会触发, 且支持 scroll-region (DECSTBM):
+	//     从滚动区顶部滚出去、否则被 libvterm 丢弃的行都会 push 出来 (见 screen.c moverect_internal).
+	//     新版 claude/codex TUI 跑在 alt-screen + scroll-region, 历史正靠这条采集.
 	//   - 不设 (nil) 则不采集, 行为与加该字段前完全一致 (导出回调判 nil 直接返回).
 	// 返回值传回 C (libvterm 忽略 sb_pushline 返回值, 给 0 即可).
 	OnSbPushLine func(cells []ScreenCell) int

@@ -93,8 +93,9 @@ import vterm "github.com/hgmGoLib/hgmLibvterm"
                                              // 唯一途径 (GetCellAt 只能读当前可见网格). 注意:
                                              //   * 与 OnDamage 一样在 Write/Flush 内同一 goroutine 同步触发,
                                              //     回调里别再锁外层 Write 已持有的锁 (自死锁).
-                                             //   * 只有主屏滚动触发; alt screen (DECSET ?1049h) 期间滚动
-                                             //     libvterm 直接丢弃, 不 push.
+                                             //   * 主屏和 alt screen (DECSET ?1049h) 的"向上滚动"都触发,
+                                             //     且支持 scroll-region (DECSTBM): 从滚动区顶部滚出去的行
+                                             //     都 push 出来 (新版 claude/codex 跑 alt-screen+region,靠这条).
                                              //   * cells 指向 libvterm 内部复用缓冲, 回调返回后会被覆盖,
                                              //     要留存必须当场读完 (ScreenCell 是值拷贝, 存切片即可).
     (*ScreenCell) Width() int                // 1 普通 / 2 宽字符

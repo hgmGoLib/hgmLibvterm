@@ -218,11 +218,23 @@ static int moverect_internal(VTermRect dest, VTermRect src, void *user)
 {
   VTermScreen *screen = user;
 
+  // sb_pushline: 把因"向上滚动"而从滚动区顶部消失、否则会被丢弃的行交给回调.
+  //
+  // upstream 原逻辑只在 主屏(primary) + 顶端对齐(dest.start_row==0) 的全屏滚动时 push.
+  // 但新版 claude / codex 等 TUI 跑在 alt-screen(DECSET ?1049h) 且用 scroll-region
+  // (DECSTBM, 例 ESC[2;55r 把滚动限制在 rows 2..55), 滚出区顶的对话历史会被 libvterm 直接丢弃
+  // —— 详情页"完整终端历史"因此只剩最后一屏. 这里放宽采集条件:
+  //   - 不再限制 primary buffer: alt-screen 的滚动同样 push (这才是 claude 现在的情况).
+  //   - 不再要求 dest.start_row==0: 任意起始行的滚动区都支持.
+  //   - 仍要求 全宽 + 向上滚动(src 在 dest 下方, downward>0). 丢失的行 = memmove 之前位于
+  //     [dest.start_row .. src.start_row-1] 的那 downward 行(滚动区顶部即将被覆盖的行).
+  //     push 必须在下面的 memmove 之前做, 此时这些行还是原内容.
+  // 对原来的全屏主屏场景完全等价: dest.start_row==0 时区间就是 [0 .. downward-1], 行为不变.
+  // OnSbPushLine 不设(nil)的调用方此分支整体跳过, 零影响.
   if(screen->callbacks && screen->callbacks->sb_pushline &&
-     dest.start_row == 0 && dest.start_col == 0 &&        // starts top-left corner
-     dest.end_col == screen->cols &&                      // full width
-     screen->buffer == screen->buffers[BUFIDX_PRIMARY]) { // not altscreen
-    for(int row = 0; row < src.start_row; row++)
+     dest.start_col == 0 && dest.end_col == screen->cols && // full width
+     src.start_row > dest.start_row) {                      // upward scroll: lines lost off region top
+    for(int row = dest.start_row; row < src.start_row; row++)
       sb_pushline_from_row(screen, row);
   }
 
