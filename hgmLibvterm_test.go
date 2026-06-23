@@ -137,6 +137,48 @@ func TestSplitUtf8AcrossWrites(t *testing.T) {
 	}
 }
 
+// TestSplitUtf8AfterAsciiAcrossWrites 复现 libvterm 的一个真实 bug (2026-06-23 实测):
+// 一个多字节 UTF-8 字符被切在两次 Write 之间, 且**第一次 Write 以 ASCII 字节开头**时,
+// 字符会被解码成 U+FFFD 乱码 —— 而上面 TestSplitUtf8AcrossWrites (第一次 Write 直接是高位
+// 首字节) 却正确. 区别只有第一次 Write 开头多了个 'A'.
+//
+// 根因 (state.c on_text 编码选择): libvterm 在 UTF-8 模式下有**两个独立的 UTF-8 解码器实例**
+// (state->encoding[gl_set] 与 state->encoding_utf8), 各自带半截序列状态 (bytes_remaining/this_cp).
+// on_text 每次按"本次调用首字节最高位"二选一:
+//
+//	!(bytes[eaten] & 0x80) ? &state->encoding[state->gl_set]   // 首字节 0x00-0x7f → GL 实例
+//	state->vt->mode.utf8   ? &state->encoding_utf8 ...          // 首字节 0x80+   → utf8 实例
+//
+// 第一次 Write "A\xe4": 首字节 'A' 是 ASCII → 整段走 GL 实例, 把半截 lead byte \xe4 的状态
+// (bytes_remaining=2) 存进 **GL 实例**. 第二次 Write "\xb8\x96": 首字节 \xb8 是高位续接字节 →
+// 路由到 **encoding_utf8 实例** (它 bytes_remaining=0) → 两个续接字节都成了 orphan continuation
+// → 各吐一个 U+FFFD. 半个字符存在这个实例、另一半喂给那个实例, 永远拼不上.
+//
+// 现实触发: claude CLI 的 TUI 输出经 PTY 每次最多 read 1024 字节, 像 " (decideDegradedViaEngine…"
+// 这种 "ASCII 文本 + 行尾省略号/CJK" 的行尾正好被 1024 边界切在多字节字符中间 → 终端历史里出现 �.
+//
+// 本测试断言**正确行为** (应还原成 'A世'), 在修复前会 FAIL —— 这就是 bug 的复现.
+// 可能修法: on_text 在 mode.utf8 时统一只用 encoding_utf8, 不按首字节高位在 gl_set/utf8 间切.
+func TestSplitUtf8AfterAsciiAcrossWrites(t *testing.T) {
+	vt, scr, _ := newTestTerm(t, 3, 20)
+	defer vt.Close()
+
+	// "A世" = 41 e4 b8 96. 切点落在 世 (e4 b8 96) 中间, 且第一次 Write 以 ASCII 'A' 开头.
+	vt.Write([]byte("A\xe4")) // ASCII 'A' + 世 的首字节 (lead)
+	vt.Write([]byte("\xb8\x96")) // 世 剩下的两个续接字节
+	scr.Flush()
+
+	c0, _ := scr.GetCellAt(0, 0)
+	c1, _ := scr.GetCellAt(0, 1)
+	if string(c0.Chars()) != "A" {
+		t.Fatalf("cell0 chars=%q, want 'A'", string(c0.Chars()))
+	}
+	if string(c1.Chars()) != "世" {
+		t.Fatalf("cell1 chars=%q, want '世' (split UTF-8 after ASCII must reassemble; "+
+			"got U+FFFD => libvterm 双解码器实例 bug)", string(c1.Chars()))
+	}
+}
+
 // TestScrollAndClear: 超出行数触发滚屏, CSI 2J 清屏由 libvterm 内部处理.
 func TestScrollAndClear(t *testing.T) {
 	vt, scr, _ := newTestTerm(t, 3, 10)
