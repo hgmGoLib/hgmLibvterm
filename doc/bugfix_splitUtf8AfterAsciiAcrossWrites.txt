@@ -1,0 +1,88 @@
+libvterm bugfix: 多字节 UTF-8 字符跨 Write 边界被切坏成 U+FFFD
+================================================================
+日期: 2026-06-23
+改动文件: state.c (on_text 的编码实例选择)
+本地对 upstream libvterm 0.3.3 C 源码的**唯一**改动.
+
+
+现象
+----
+在 UTF-8 模式下, 把一段文本分多次 vterm_input_write 喂进来时, 如果某个多字节 UTF-8
+字符 (CJK / 省略号 … / 箭头 → / box-drawing ─ 等) 正好被切在两次 Write 之间, 且
+**这次 Write 是以 ASCII 字节开头的**, 该字符就会被解码成一个或多个 U+FFFD (`�`) 乱码.
+
+典型触发: 终端应用 (如 claude CLI 的 TUI) 的输出经 PTY 传来, macOS PTY 每次 read 上限
+1024 字节, 一行 "ASCII 文本 + 行尾 CJK/省略号" 正好被 1024 边界切在多字节字符中间, 例如:
+    Write1: "...(decideDegradedViaEngine\xe2\x80"   (… = e2 80 a6, 只来了前两字节)
+    Write2: "\xa6)..."                              (续接字节 a6 在下一次 read 开头)
+期望渲染 "…)", 实际渲染 "�)".
+
+注意: 同样的字符如果被切在**以高位字节开头**的 Write 里 (例如 Write1 直接是 "\xe2\x80",
+Write2 是 "\xa6") 却能正确还原. 区别只在于被切字符前面有没有 ASCII 文本和它同在一次 Write.
+
+
+根因
+----
+libvterm 走 ISO-2022 编码模型, VTermState 里有**多个独立的编码器实例**, 各自带自己的
+半截多字节序列解码状态 (UTF-8 解码器的 struct UTF8DecoderData { bytes_remaining, this_cp }):
+  - state->encoding[0..3]   (G0..G3 指派的字符集; gl_set/gr_set 指向其中之一)
+  - state->encoding_utf8    (UTF-8 模式专用的那一个实例)
+
+reset() 时, UTF-8 模式下 state->encoding[0..3] 全部被指派成 UTF-8 编码集 (与 encoding_utf8
+是**同一个 VTermEncoding** 静态对象, 但各自带**独立的** data 状态), gl_set=0, gr_set=1.
+
+on_text() 每次按"本次调用首字节的最高位"在实例间二选一 (state.c, 修复前):
+    encoding =
+      gsingle_set        ? &encoding[gsingle_set] :
+      !(byte0 & 0x80)    ? &encoding[gl_set]      :   // 首字节 0x00-0x7f → GL 实例
+      mode.utf8          ? &encoding_utf8         :   // 首字节 0x80+   → utf8 实例
+                           &encoding[gr_set];
+
+于是当一个多字节字符被切成 [ASCII 文本... + 半截 lead/cont] | [剩余 cont]:
+  - 前半段这次 on_text 首字节是 ASCII → 整段 (含半截多字节序列) 走 encoding[gl_set] 实例,
+    把 bytes_remaining 状态存进了 **encoding[gl_set]**.
+  - 后半段下次 on_text 首字节是 0x80+ 续接字节 → 路由到 **encoding_utf8** 实例,
+    而它的 bytes_remaining=0 → 续接字节成了 orphan continuation → 吐 U+FFFD.
+半个字符存在这个实例、另一半喂给那个实例, 跨 Write 永远拼不上.
+
+(纯高位字节的多字节字符被切时两半都走 encoding_utf8 同一实例, 所以能正确还原; 这就是
+"前面有没有 ASCII" 决定成败的原因.)
+
+
+修复
+----
+把"UTF-8 模式且 GL 仍指派默认 UTF-8 编码集"的判断**提到首字节高位判断之前**, 让整条 UTF-8
+文本流 (无论首字节是 ASCII 还是高位) 统一走 encoding_utf8 这**一个**实例, 半截序列状态自然
+跨 Write 续得上 (state.c on_text):
+    encoding =
+      gsingle_set ? &encoding[gsingle_set] :
+      (mode.utf8 && encoding[gl_set].enc == encoding_utf8.enc) ? &encoding_utf8 :  // ← 新增
+      !(byte0 & 0x80) ? &encoding[gl_set] :
+      mode.utf8       ? &encoding_utf8    :
+                        &encoding[gr_set];
+
+判断 `encoding[gl_set].enc == encoding_utf8.enc`: vterm_lookup_encoding(ENC_UTF8,'u') 返回的是
+同一个静态 VTermEncoding 指针, 所以默认 (没有 ESC ( 0 之类把别的字符集指派进 G0) 时这俩相等,
+走单实例; 一旦 ESC ( 0 把 DEC 制表符等**非 UTF-8** 字符集指派进 GL, 指针不等, 就回退到原
+GL/GR 逻辑 —— 此时 ASCII 范围字节按指派的字符集渲染 (line-drawing), 而多字节 UTF-8 字符整体
+都是高位字节, 只会进 encoding_utf8, 不存在被分到两个实例的问题. 所以修复不影响 ESC ( 0 等
+字符集指派场景的正确性.
+
+只改了 UTF-8 模式的默认路径, 非 UTF-8 模式 (mode.utf8=false) 的 GL/GR 走法一字未动.
+
+
+验证
+----
+- 单测 hgmLibvterm_test.go:
+    TestSplitUtf8AcrossWrites           (对照: 无 ASCII 前缀, 修复前就 PASS)
+    TestSplitUtf8AfterAsciiAcrossWrites (复现: 4 字节最小输入 "A\xe4" | "\xb8\x96",
+                                         期望 "A世"; 修复前 FAIL=cell1 为 �, 修复后 PASS)
+  go test ./hgmLibvterm/ -v 全套 17 个测试通过.
+- 真实数据回放 (claude CLI 一次调用的原始 PTY 字节流, 1160 个 read chunk 按真实边界逐块喂):
+  修复前 31 个 U+FFFD, 修复后 0 个, 且逐块喂的渲染结果与整条一次喂完全一致.
+
+
+上游
+----
+这是 upstream libvterm 0.3.3 的固有行为. 升级 libvterm 重新覆盖 C 源码时, 这个改动会被覆盖掉,
+需要按本文档在新版 state.c 的 on_text 编码选择处重新打上 (升级清单见 readme.txt).

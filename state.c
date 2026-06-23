@@ -281,8 +281,20 @@ static int on_text(const char bytes[], size_t len, void *user)
   int npoints = 0;
   size_t eaten = 0;
 
+  /* UTF-8 模式且 GL 仍指派默认 UTF-8 编码集 (没有 ESC ( 0 之类把别的字符集指派进 G0) 时,
+   * 整条文本流 (无论首字节是 0x00-0x7f 还是 0x80+) 都统一走 encoding_utf8 这**一个**实例.
+   * 否则原逻辑会按"本次 on_text 首字节最高位"在 encoding[gl_set] 与 encoding_utf8 两个独立
+   * UTF-8 解码器实例间二选一, 而一个多字节 UTF-8 字符被 PTY read 边界切成两次 Write 时
+   * (例如 "...ASCII文本+半截\xe2\x80" | "\xa6..."), 前半截的 bytes_remaining 状态存进了
+   * encoding[gl_set] 实例, 后半截的续接字节却被路由到 encoding_utf8 实例 (bytes_remaining=0),
+   * 两半永远拼不上 -> 吐出 U+FFFD. 把 mode.utf8+GL=UTF-8 的判断提到首字节高位判断之前即可消除
+   * 这个跨实例分裂. ESC ( 0 等把非 UTF-8 字符集 (DEC 制表符等) 指派进 GL 的场景仍按原 GL/GR
+   * 逻辑走 (此时多字节 UTF-8 字符整体都是高位字节, 只会进 encoding_utf8, 不会被分裂).
+   * 详见 doc/bugfix_splitUtf8AfterAsciiAcrossWrites.txt */
   VTermEncodingInstance *encoding =
-    state->gsingle_set     ? &state->encoding[state->gsingle_set] :
+    state->gsingle_set ? &state->encoding[state->gsingle_set] :
+    (state->vt->mode.utf8 && state->encoding[state->gl_set].enc == state->encoding_utf8.enc) ?
+                             &state->encoding_utf8 :
     !(bytes[eaten] & 0x80) ? &state->encoding[state->gl_set] :
     state->vt->mode.utf8   ? &state->encoding_utf8 :
                              &state->encoding[state->gr_set];

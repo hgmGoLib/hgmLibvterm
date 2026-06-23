@@ -136,7 +136,15 @@ C 源码从哪来
   include/vterm.h
   include/vterm_keycodes.h -> ./include/*.h            (-I${SRCDIR}/include)
   LICENSE                  -> ./LICENSE
-C 源码本身一个字没改.
+C 源码基本照搬上游, 仅有一处本地 bugfix (见下面"本地对 C 源码的改动").
+
+
+本地对 C 源码的改动
+-------------------
+对 upstream libvterm 0.3.3 的 C 源码只打了一个 bugfix patch:
+  state.c (on_text 编码实例选择): 修 "多字节 UTF-8 字符跨 Write 边界被切坏成 U+FFFD".
+  详见 doc/bugfix_splitUtf8AfterAsciiAcrossWrites.txt (含现象/根因/修法/验证).
+升级 libvterm 重新覆盖 C 源码时, 这个 patch 会被覆盖掉, 必须按该文档重新打上.
 
 Go 绑定 (hgmLibvterm.go) 是按需自己写的最小版, 思路参考过 github.com/mattn/go-libvterm,
 但只暴露用到的那点 API, 且用 runtime/cgo.Handle 取代了 go-pointer, 不引入任何第三方 Go 依赖.
@@ -145,9 +153,11 @@ Go 绑定 (hgmLibvterm.go) 是按需自己写的最小版, 思路参考过 githu
 怎么升级 libvterm
 -----------------
 1. 下新版 release tarball, 核对 sha256.
-2. 按上面"拷进来的文件"清单覆盖对应文件 (C 源码不要手改).
-3. 如果上游加了新的 .c / .inc, 对应补上.
-4. 跑测试: go test ./hgmLibvterm/ -v
+2. 按上面"拷进来的文件"清单覆盖对应文件 (除下面这条 bugfix 外, C 源码不要手改).
+3. 重新打上本地 bugfix: state.c on_text 的编码实例选择, 见
+   doc/bugfix_splitUtf8AfterAsciiAcrossWrites.txt (覆盖后会丢, 必须重打).
+4. 如果上游加了新的 .c / .inc, 对应补上.
+5. 跑测试: go test ./hgmLibvterm/ -v (TestSplitUtf8AfterAsciiAcrossWrites 必须通过, 它专测这个 bug)
 
 
 测试
