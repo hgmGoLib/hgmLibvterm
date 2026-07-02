@@ -98,6 +98,13 @@ import vterm "github.com/hgmGoLib/hgmLibvterm"
                                              //     都 push 出来 (新版 claude/codex 跑 alt-screen+region,靠这条).
                                              //   * cells 指向 libvterm 内部复用缓冲, 回调返回后会被覆盖,
                                              //     要留存必须当场读完 (ScreenCell 是值拷贝, 存切片即可).
+    Screen.OnSetTermProp func(prop int, boolVal bool) int // 字段, 可不设. 终端属性变化时同步回调
+                                             // (同 OnDamage, 在 Write/Flush 内). prop 是 VTermProp 常量,
+                                             // 目前只导出 PropAltScreen; boolVal 只对布尔 prop 有意义.
+                                             // 典型用途: 侦测 TUI 进/出 alt-screen (?1049h/l), 比如在
+                                             // "离开 alt-screen"(boolVal=false) 时冻结最后一帧, 避免退出
+                                             // 尾声覆盖. 注: 未 enable_altscreen 时"进入"不回调,"离开"始终回调.
+    PropAltScreen int                        // 常量 = VTERM_PROP_ALTSCREEN, 用于 OnSetTermProp 判 prop
     (*ScreenCell) Width() int                // 1 普通 / 2 宽字符
     (*ScreenCell) Chars() []rune             // 码点, 读到 0 止
     (*Rect) StartRow/EndRow/StartCol/EndCol() int

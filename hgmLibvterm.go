@@ -19,20 +19,31 @@ package hgmLibvterm
 #include <vterm.h>
 #include <stdint.h>
 
-// damage / sb_pushline 回调由 Go 实现 (见下方 //export). 其余回调置 NULL.
+// damage / sb_pushline / settermprop 回调由 Go 实现 (见下方 //export). 其余回调置 NULL.
 // 注意 cgo 按 Go 签名生成的原型是非 const 指针 (VTermScreenCell*), 而 libvterm 的 sb_pushline
 // 字段要求 const VTermScreenCell* —— 直接装会 "conflicting types". 所以下面用一个 const 签名的
 // C 蹦床 _hgm_sb_pushline 装进回调结构, 内部去 const 转调 Go 导出实现.
 extern int _go_vt_damage(VTermRect rect, void *user);
 extern int _go_vt_sb_pushline(int cols, VTermScreenCell *cells, void *user);
+extern int _go_vt_settermprop(int prop, int boolval, void *user);
 
 static int _hgm_sb_pushline(int cols, const VTermScreenCell *cells, void *user) {
 	return _go_vt_sb_pushline(cols, (VTermScreenCell *)cells, user);
 }
 
+// _hgm_settermprop 蹦床: 只把 bool 类型 prop 的值抽成 int 交给 Go (非 bool prop 传 0).
+// Go 侧目前只关心 VTERM_PROP_ALTSCREEN (进/出 alt-screen), 见 Screen.OnSetTermProp.
+static int _hgm_settermprop(VTermProp prop, VTermValue *val, void *user) {
+	int b = 0;
+	if(vterm_get_prop_type(prop) == VTERM_VALUETYPE_BOOL)
+		b = val->boolean;
+	return _go_vt_settermprop((int)prop, b, user);
+}
+
 static VTermScreenCallbacks _hgm_screen_cbs = {
 	.damage      = _go_vt_damage,
 	.sb_pushline = _hgm_sb_pushline,
+	.settermprop = _hgm_settermprop,
 };
 
 // _hgm_set_screen_cbs 把 cgo.Handle (uintptr) 当不透明 void* 存进 libvterm,
@@ -76,7 +87,19 @@ type Screen struct {
 	//   - 不设 (nil) 则不采集, 行为与加该字段前完全一致 (导出回调判 nil 直接返回).
 	// 返回值传回 C (libvterm 忽略 sb_pushline 返回值, 给 0 即可).
 	OnSbPushLine func(cells []ScreenCell) int
+	// OnSetTermProp 在终端属性 (VTermProp) 变化时同步回调 (与 OnDamage 一样在 Write/Flush 内、
+	// 同一 goroutine 触发). prop 是 VTermProp 常量 (目前只导出 PropAltScreen); boolVal 只对
+	// 布尔类型的 prop 有意义 (非布尔 prop 恒为 false, 调用方应按 prop 判断).
+	//   - 典型用途: 侦测 TUI 进/出 alt-screen (?1049h/l). 注意 libvterm 只在 alt-screen buffer
+	//     已分配时才转发"进入 alt-screen"; 未调用 enable_altscreen 时"进入"不会回调, 但"离开"
+	//     (boolVal=false) 始终会回调 (见 screen.c settermprop).
+	//   - 不设 (nil) 则不回调, 行为与加该字段前完全一致.
+	OnSetTermProp func(prop int, boolVal bool) int
 }
+
+// PropAltScreen 对应 VTERM_PROP_ALTSCREEN (bool): 终端进入/离开 alt-screen (DECSET ?1049).
+// 用于 OnSetTermProp 里判断 prop.
+const PropAltScreen = int(C.VTERM_PROP_ALTSCREEN)
 
 // Rect 是一块屏幕矩形区域 (damage 回调参数). 当前调用方只把它当不透明标志位用,
 // 但保留坐标访问以备后用.
@@ -228,4 +251,13 @@ func _go_vt_sb_pushline(cols C.int, cells *C.VTermScreenCell, user unsafe.Pointe
 		out[i] = ScreenCell{cell: C._hgm_sb_cell_at(cells, C.int(i))}
 	}
 	return C.int(scr.OnSbPushLine(out))
+}
+
+//export _go_vt_settermprop
+func _go_vt_settermprop(prop C.int, boolval C.int, user unsafe.Pointer) C.int {
+	scr, ok := cgo.Handle(uintptr(user)).Value().(*Screen)
+	if !ok || scr.OnSetTermProp == nil {
+		return 1
+	}
+	return C.int(scr.OnSetTermProp(int(prop), boolval != 0))
 }
